@@ -1136,15 +1136,21 @@ select s.snapshot_name, s.start_time, fs.*
 from qpi.file_stats_snapshots s
 cross apply qpi.db_file_stats_at(s.snapshot_name) fs;
 GO
+
+
+
+
 CREATE OR ALTER  FUNCTION qpi.memory_mb()
 RETURNS int AS
 BEGIN
- RETURN (SELECT process_memory_limit_mb FROM sys.dm_os_job_object);
+	RETURN (SELECT size_mb = MIN(CAST(size_mb AS INT))
+			FROM (
+				SELECT size_mb = maximum FROM [master].[sys].[configurations] WHERE NAME = 'Max server memory (MB)'
+				UNION ALL
+				SELECT size_mb = physical_memory_kb/1024. FROM sys.dm_os_sys_info
+			) as m)
 END
 GO
-
-
-
 CREATE OR ALTER  VIEW qpi.volumes
 AS
 SELECT	volume_mount_point,
@@ -1162,15 +1168,13 @@ CREATE OR ALTER  VIEW qpi.sys_info
 AS
 SELECT
 
-	cpu_count = virtual_core_count, service_tier, hardware_generation, max_storage_gb,
+
+
+	cpu_count = cpu_count,
+
 	memory_gb = ROUND(qpi.memory_mb() /1024.,1),
 	sqlserver_start_time
 FROM sys.dm_os_sys_info
-
-	, (select top 1 service_tier = sku, virtual_core_count, hardware_generation, max_storage_gb = reserved_storage_mb/1024
-	from master.sys.server_resource_stats
-	where start_time > DATEADD(mi, -7, GETUTCDATE())) as srs
-
 GO
 
 
@@ -1284,177 +1288,10 @@ SELECT	name, reason, score,
         script = JSON_VALUE(details, '$.implementationDetails.script'),
         details
 FROM sys.dm_db_tuning_recommendations
-
-
-UNION ALL
-SELECT	name = 'AZURE_STORAGE_35_TB_LIMIT',
-		reason = 'Remaining number of database files is low',
-		score = (alloc.size_tb/35.)*100,
-		[state] = NULL, script = NULL,
-		details = CONCAT( 'You cannot create more than ', (35 - alloc.size_tb) * 8, ' additional database files.')
-FROM
-( SELECT
-SUM(CASE WHEN  CAST(size * 8. / 1024 / 1024 AS decimal(12,4))  <= 128 THEN 128
-WHEN  CAST(size * 8. / 1024 / 1024 AS decimal(12,4))  > 128 AND  CAST(size * 8. / 1024 / 1024 AS decimal(12,4))  <= 256 THEN 256
-WHEN  CAST(size * 8. / 1024 / 1024 AS decimal(12,4))  > 256 AND  CAST(size * 8. / 1024 / 1024 AS decimal(12,4))  <= 512 THEN 512
-WHEN  CAST(size * 8. / 1024 / 1024 AS decimal(12,4))  > 512 AND  CAST(size * 8. / 1024 / 1024 AS decimal(12,4))  <= 1024 THEN 1024
-WHEN  CAST(size * 8. / 1024 / 1024 AS decimal(12,4))  > 1024 AND  CAST(size * 8. / 1024 / 1024 AS decimal(12,4))  <= 2048 THEN 2048
-WHEN  CAST(size * 8. / 1024 / 1024 AS decimal(12,4))  > 2048 AND  CAST(size * 8. / 1024 / 1024 AS decimal(12,4))  <= 4096 THEN 4096
-ELSE 8192
-END)/1024
-FROM master.sys.master_files
-WHERE physical_name LIKE 'https:%') AS alloc(size_tb)
-WHERE alloc.size_tb > 30
-UNION ALL
-SELECT name =
-	 CASE CAST(volume_mount_point as CHAR(1))
-		WHEN 'C' THEN 'Reaching TempDB size limit on local storage.'
-		ELSE 'Reaching storage size limit on instance.'
-	END,
-		reason = 'STORAGE_LIMIT',
-		score = used_gb/total_gb,
-		[state] = NULL, script = NULL,
-		details = CONCAT( 'You are using ' , used_gb,'GB out of ', total_gb, 'GB')
-from qpi.volumes
-WHERE used_gb/total_gb > .8
-UNION ALL
-SELECT name = 'Reaching storage size limit on instance',
-		reason = 'STORAGE_LIMIT',
-		score = 100*storage_usage_perc*storage_usage_perc,
-		[state] = NULL, script = NULL,
-		details = CONCAT( 'In 2 hours the instance will reach ' , CAST(storage_usage_perc AS NUMERIC(4,2)), '% of your storage - increase the instance storage now.')
-from (
-select top 1 storage_usage_perc =
-(storage_space_used_mb +
-((storage_space_used_mb - lead (storage_space_used_mb, 100) over (order by start_time desc))
-	/
-DATEDIFF(mi, lead (start_time, 100) over (order by start_time desc), start_time))  * 120)
-/ reserved_storage_mb
-from master.sys.server_resource_stats
-where storage_space_used_mb > (.8 * reserved_storage_mb) -- ignore if the current storage is less than 80%
-order by start_time desc
-) a(storage_usage_perc)
-WHERE a.storage_usage_perc > .8
-UNION ALL
-SELECT	name = 'CPU_PRESSURE',
-		reason = CONCAT('High CPU usage ', cpu ,' on the instance in past hour.'),
-		score = cpu/100.,
-		[state] = NULL, script = 'N/A: Find top queries that are using a lot of CPU and optimize them or add more cores by upgrading the instance.',
-		details = CONCAT( 'Instance is using ', cpu, '% of CPU.')
-FROM (select cpu = AVG(avg_cpu_percent)
-	from master.sys.server_resource_stats
-	where start_time > DATEADD(hour , -1, GETUTCDATE())) as usage(cpu)
-where cpu > .85
-UNION ALL
-select
-        name = wait_type COLLATE Latin1_General_100_CI_AS,
-		reason = CASE wait_type
-                    WHEN 'INSTANCE_LOG_RATE_GOVERNOR' THEN CONCAT('Reaching ',
-                     (SELECT TOP 1 CASE WHEN sku = 'General Purpose' THEN '22'
-                                ELSE '48' END
-                        from master.sys.server_resource_stats
-                        where start_time > DATEADD(minute , -10, GETUTCDATE())), ' MB/s instance log rate limit.' )
-                    WHEN 'WRITELOG' THEN 'Potentially reaching the IO limits of log file.'
-                    ELSE 'Potentially reaching the IO limit of data file.'
-                END COLLATE Latin1_General_100_CI_AS,
-        score = 80.,
-		[state] = NULL,
-        script = 'N/A - this is Managed Instance limit' COLLATE Latin1_General_100_CI_AS,
-		details = null
- from (select top 10 *
-from sys.dm_os_wait_stats
-order by wait_time_ms desc) as ws
-where wait_type in ('INSTANCE_LOG_RATE_GOVERNOR', 'WRITELOG')
-or wait_type like 'PAGEIOLATCH%'
-
 GO
 ---------------------------------------------------------------------------------------------------------
 --			High availability
 ---------------------------------------------------------------------------------------------------------
-
-CREATE OR ALTER  VIEW
-qpi.nodes
-AS
-with nodes as (
-	select db_name = DB_NAME(database_id),
-		minlsn = CONVERT(NUMERIC(38,0), ISNULL(truncation_lsn, 0)),
-		maxlsn = CONVERT(NUMERIC(38,0), ISNULL(last_hardened_lsn, 0)),
-		seeding_state =
-			CASE WHEN seedStats.internal_state_desc NOT IN ('Success', 'Failed') OR synchronization_health = 1
-						THEN 'Warning' ELSE
-                     (CASE WHEN synchronization_state = 0 OR synchronization_health != 2
-							THEN 'ERROR' ELSE 'OK' END)
-			END,
-		replication_endpoint_url =
-		CASE WHEN replication_endpoint_url IS NULL AND (synchronization_state = 1  OR fccs.partner_server IS NOT NULL)
-			THEN fccs.partner_server + ' - ' + fccs.partner_database -- Geo replicas will be in Synchronizing state
-        ELSE replication_endpoint_url END,
-		repl_states.* , seedStats.internal_state_desc, frs.fabric_replica_role
-		from sys.dm_hadr_database_replica_states repl_states
-              LEFT JOIN sys.dm_hadr_fabric_replica_states frs
-                     ON repl_states.replica_id = frs.replica_id
-              LEFT OUTER JOIN sys.dm_hadr_physical_seeding_stats seedStats
-                     ON seedStats.remote_machine_name = replication_endpoint_url
-                     AND (seedStats.local_database_name = repl_states.group_id OR seedStats.local_database_name = DB_NAME(database_id))
-                     AND seedStats.internal_state_desc NOT IN ('Success', 'Failed')
-              LEFT OUTER JOIN sys.dm_hadr_fabric_continuous_copy_status fccs
-                     ON repl_states.group_database_id = fccs.copy_guid
-),
-nodes_progress AS (
-SELECT *, logprogresssize_p =
-                     CASE WHEN maxlsn - minlsn != 0 THEN maxlsn - minlsn
-                           ELSE 0 END
-FROM nodes
-),
-nodes_progress_size as (
-select
-	log_progress_size = CASE WHEN last_hardened_lsn > minlsn AND logprogresssize_p > 0
-				THEN (CONVERT(NUMERIC(38,0), last_hardened_lsn) - minlsn)*100.0/logprogresssize_p
-    ELSE 0 END,
-	*
-	from nodes_progress
-)
-SELECT
-	database_id, db_name,
-	replication_endpoint_url,
-	catchup_progress = CASE WHEN internal_state_desc IS NOT NULL -- Check for active seeding
-                           THEN 'Seeding'
-                     WHEN logprogresssize_p > 0
-                           THEN CONVERT(VARCHAR(100), CONVERT(NUMERIC(20,2),log_progress_size)) + '%'
-                     ELSE 'Select the Primary Node' END,
-	is_local,
-	is_primary_replica,
-	seeding_state,
-	synchronization_health_desc,
-	synchronization_state_desc,
-	secondary_lag_seconds,
-	suspend_reason_desc,
-	send_rate_kbps = log_send_rate,
-	redo_rate_kbps = redo_rate,
-	send_queue_size_kb = log_send_queue_size,
-	redo_queue_size_kb = redo_queue_size,
-	last_sent_time,
-	last_received_time,
-	last_hardened_time,
-	last_redone_time,
-	recovery_lsn,
-	truncation_lsn,
-	last_sent_lsn,
-	last_received_lsn,
-	last_hardened_lsn,
-	last_redone_lsn,
-	end_of_log_lsn,
-	last_commit_lsn,
-	minlsn, maxlsn
-	FROM nodes_progress_size;
-GO
-
-CREATE OR ALTER  VIEW
-qpi.db_nodes
-AS
-SELECT * FROM qpi.nodes WHERE database_id = DB_ID();
-GO
-
 ---------------------------------------------------------------------------------------------------
 --				Performance counters
 ---------------------------------------------------------------------------------------------------
@@ -1584,12 +1421,11 @@ and B2.cntr_type = 1073939712 -- PERF_LARGE_RAW_BASE
 SELECT	name= RTRIM(pc.name), pc.value, type = RTRIM(pc.type), category = RTRIM(pc.object),
 		instance_name =
 
-			RTRIM(ISNULL(d.name, pc.instance_name))
+
+
+			RTRIM(pc.instance_name)
+
 FROM perf_counter_calculation pc
-
-left join sys.databases d
-			on  (pc.instance_name) COLLATE Latin1_General_100_CI_AS = (d.physical_database_name) COLLATE Latin1_General_100_CI_AS
-
 WHERE value > 0
 )
 GO

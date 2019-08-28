@@ -4,14 +4,11 @@ Query Performance Insight library enables you to easily get the performance insi
 
 The following query returns number of requests per second and CPU% used by queries per query store intervals:
 ```
-select start_time,
+select start_time, execution_type_desc,
 	tps =  sum(count_executions)/ min(interval_mi) /60,
-	tph =  sum(count_executions) * 60 / min(interval_mi),
-	[cpu %] = ROUND(100 * sum(count_executions*cpu_time_s)/ min(interval_mi) /60 /(SELECT top 1 cpu_count FROM sys.dm_os_sys_info)/*cores*/,1)
-from qpi.query_stats
-where interval_mi is not null
-and execution_type_desc = 'Regular'
-group by start_time
+	[cpu %] = ROUND(100 * sum(count_executions*cpu_time_s)/ min(interval_mi) /60 /(SELECT top 1 cpu_count FROM sys.os_sys_info)/*cores*/,1)
+from qpi.db_query_plan_exec_stats_history
+group by start_time, execution_type_desc
 order by start_time desc
 ```
 
@@ -28,13 +25,21 @@ EXEC qpi.snapshot_file_stats @title = 'M2';
 EXEC qpi.snapshot_file_stats @title = 'M3';
 
 SELECT *
-FROM qpi.runtime_file_stats_on( qpi.ago(215) );
+FROM qpi.file_stats_as_of( qpi.ago(0,2,15) );
 
 
 SELECT *
-FROM qpi.runtime_file_stats_at( 'M2' )
+FROM qpi.file_stats_at( 'M2' )
 
 SELECT *
-FROM qpi.runtime_file_stats
+FROM qpi.file_stats
 WHERE database_name = 'tpcc5000'
+```
+
+You can also view wait statistics on the instance:
+```
+select category, wait_s = sum(wait_time_ms)/1000
+from qpi.wait_stats
+group by category_id, category
+order by sum(wait_time_ms) desc
 ```
